@@ -3,7 +3,7 @@ import * as SplashScreen from 'expo-splash-screen';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useState } from 'react';
 
-import { recoverUnfinishedJourneys } from '@/src/db/database';
+import { recoverUnfinishedJourneys, refreshOutdatedStats } from '@/src/db/database';
 import { RecordingProvider } from '@/src/recording/RecordingContext';
 import { colors } from '@/src/theme';
 
@@ -20,8 +20,10 @@ export default function RootLayout() {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    // Close any journey left open by a crash or force-stop before showing the UI.
+    // Before showing the UI: close any journey left open by a crash or force-stop, and
+    // recalculate trips whose stored statistics come from an older version of the formulas.
     recoverUnfinishedJourneys()
+      .then(refreshOutdatedStats)
       .catch((e) => console.warn('Recovery failed', e))
       .finally(() => {
         setReady(true);

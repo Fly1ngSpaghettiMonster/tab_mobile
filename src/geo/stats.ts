@@ -26,8 +26,10 @@ export type JourneyStats = {
 
 // Fixes worse than this are kept in the log but ignored for the route and statistics.
 export const MAX_ACCURACY_METERS = 25;
-// Anything implying a faster jump than this (~250 km/h) is treated as a glitch.
-const MAX_PLAUSIBLE_SPEED_MPS = 70;
+// Anything implying a faster movement than this is treated as a glitch: a bad fix that jumps a
+// few hundred metres in a second implies thousands of km/h. Set to the top speed of the fastest
+// production cars (~470 km/h), so no real car trip is ever filtered out.
+export const MAX_PLAUSIBLE_SPEED_MPS = 470 / 3.6;
 // Below this speed we treat the device as standing still, so GPS jitter while
 // parked or waiting at a light does not add distance (~1.8 km/h).
 const STATIONARY_SPEED_MPS = 0.5;
@@ -130,18 +132,35 @@ export function processTrack(samples: GpsSample[]): TrackPoint[] {
   return out;
 }
 
-export function computeStats(samples: GpsSample[], endTimeMs?: number): JourneyStats {
+/**
+ * Statistics of a track. Gaps that were filled along the road network count with the road
+ * length instead of the straight line between the fixes on either side.
+ */
+/** Bump when computeStats or its thresholds change, so stored trips are recalculated. */
+export const STATS_VERSION = 2;
+
+export function computeStats(
+  samples: GpsSample[],
+  endTimeMs?: number,
+  gapFills: { fromSequence: number; toSequence: number; lengthMeters: number }[] = [],
+): JourneyStats {
   const points = processTrack(samples);
+  const fillLength = new Map(gapFills.map((f) => [`${f.fromSequence}-${f.toSequence}`, f.lengthMeters]));
   let distance = 0;
   let maxSpeed = 0;
   let movingSeconds = 0;
   for (let i = 0; i < points.length; i++) {
     const p = points[i];
-    distance += p.segmentMeters;
+    const filled = i > 0 ? fillLength.get(`${points[i - 1].sample.sequence}-${p.sample.sequence}`) : undefined;
+    const segment = filled ?? p.segmentMeters;
+    distance += segment;
     const speedTrusted = p.sample.speedAccuracyMps == null || p.sample.speedAccuracyMps <= MAX_SPEED_ACCURACY_MPS;
     if (speedTrusted) maxSpeed = Math.max(maxSpeed, p.speedMps);
-    if (i > 0 && p.speedMps >= MOVING_THRESHOLD_MPS) {
-      movingSeconds += (timeMs(p.sample) - timeMs(points[i - 1].sample)) / 1000;
+    if (i > 0) {
+      const seconds = (timeMs(p.sample) - timeMs(points[i - 1].sample)) / 1000;
+      // Moving if the fix says so, or if the distance covered since the previous fix says so:
+      // after a long gap (tunnel, underground) the speed at its end can be zero.
+      if (p.speedMps >= MOVING_THRESHOLD_MPS || segment / seconds >= MOVING_THRESHOLD_MPS) movingSeconds += seconds;
     }
   }
   const start = samples.length ? timeMs(samples[0]) : 0;

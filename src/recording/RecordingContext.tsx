@@ -4,11 +4,19 @@ import { AppState, PermissionsAndroid, Platform } from 'react-native';
 import TabGps, { type GpsFix } from '../../modules/tab-gps';
 import { createJourney, deleteJourney, finishJourney, insertSample } from '../db/database';
 import { computeStats, isAccurate, type GpsSample, type JourneyStats } from '../geo/stats';
+import { processJourneyGaps } from './gapProcessing';
 
 const MAX_LOG_ENTRIES = 500;
 const GPS_INTERVAL_MS = 1000;
 // Stored with every journey so recordings made with different settings can be told apart.
-export const LOCATION_SOURCE = `gps ${GPS_INTERVAL_MS}ms`;
+export const LOCATION_SOURCE = `fused high-accuracy ${GPS_INTERVAL_MS}ms`;
+// With at least this many satellites in the fix we call it a GNSS fix; otherwise it is Wi-Fi/cell.
+const MIN_SATELLITES_FOR_GNSS = 4;
+
+/** Where a fused fix most likely came from, judged by the satellites used at that moment. */
+export function fixSource(satellitesUsed: number | null): 'gnss' | 'net' {
+  return (satellitesUsed ?? 0) >= MIN_SATELLITES_FOR_GNSS ? 'gnss' : 'net';
+}
 // Only update the map bearing when moving fast enough for the GPS course to be meaningful.
 const MIN_SPEED_FOR_BEARING_MPS = 1;
 
@@ -20,6 +28,7 @@ export type LogEntry = {
   speedMps: number | null;
   accuracyMeters: number | null;
   provider: string;
+  source: 'gnss' | 'net';
   satellitesUsed: number;
   satellitesInView: number;
   accepted: boolean;
@@ -53,7 +62,7 @@ const RecordingContext = createContext<RecordingContextValue | null>(null);
 
 export function RecordingProvider({ children }: { children: ReactNode }) {
   const [permission, setPermission] = useState<PermissionState>('unknown');
-  const [gpsEnabled, setGpsEnabled] = useState(() => TabGps.isGpsEnabled());
+  const [gpsEnabled, setGpsEnabled] = useState(() => TabGps.isLocationEnabled());
   const [lastFix, setLastFix] = useState<GpsFix | null>(null);
   const [bearing, setBearing] = useState(0);
   const [satellites, setSatellites] = useState({ used: 0, inView: 0 });
@@ -79,6 +88,8 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
 
   const handleFix = useCallback((fix: GpsFix) => {
     setLastFix(fix);
+    // A fix means location is on, whatever was read before.
+    setGpsEnabled(true);
     if (fix.bearing != null && (fix.speed ?? 0) >= MIN_SPEED_FOR_BEARING_MPS) setBearing(fix.bearing);
 
     const jid = journeyIdRef.current;
@@ -107,6 +118,7 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       speedMps: sample.speedMps,
       accuracyMeters: sample.accuracyMeters,
       provider: fix.provider,
+      source: fixSource(fix.satellitesUsed),
       satellitesUsed: fix.satellitesUsed,
       satellitesInView: fix.satellitesInView,
       accepted: isAccurate(sample),
@@ -133,7 +145,6 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
             : { used: s.satellitesUsed, inView: s.satellitesInView },
         ),
       ),
-      TabGps.addListener('onProviderStatus', (s) => setGpsEnabled(s.enabled)),
     ];
     return () => subs.forEach((s) => s.remove());
   }, [handleFix]);
@@ -143,10 +154,11 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
   // foreground service keeps the process alive.
   useEffect(() => {
     if (permission !== 'granted') return;
+    TabGps.ensureLocationSettings(GPS_INTERVAL_MS).catch((e) => console.warn('Location settings check failed', e));
     TabGps.startUpdates(GPS_INTERVAL_MS).catch((e) => console.warn('Failed to start GPS', e));
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
-        setGpsEnabled(TabGps.isGpsEnabled());
+        setGpsEnabled(TabGps.isLocationEnabled());
         TabGps.startUpdates(GPS_INTERVAL_MS).catch((e) => console.warn('Failed to start GPS', e));
       } else if (state === 'background' && journeyIdRef.current == null) {
         TabGps.stopUpdates();
@@ -189,6 +201,8 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       saved = null;
     } else {
       await finishJourney(id, new Date(now).toISOString(), computeStats(recorded, now));
+      // Fill GPS gaps along roads in the background; the trip screen picks up the result.
+      processJourneyGaps(id).catch((e) => console.warn('Gap processing failed', e));
     }
 
     setJourneyId(null);

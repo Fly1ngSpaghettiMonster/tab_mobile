@@ -17,8 +17,8 @@ export default function LogsScreen() {
             {rec.isRecording ? `● Recording trip #${rec.journeyId} · ${rec.samples.length} saved` : 'Not recording'}
           </Text>
           <Text style={styles.source}>
-            Source: Android GPS provider, satellites only ({LOCATION_SOURCE}) · now {rec.satellites.used}/
-            {rec.satellites.inView} satellites used/in view
+            Source: {LOCATION_SOURCE} · now {rec.satellites.used}/{rec.satellites.inView} satellites used/in
+            view · src: gnss = satellite fix, net = Wi-Fi/cell
           </Text>
         </View>
         <Pressable onPress={rec.clearLog}>
@@ -57,7 +57,7 @@ function LogLine({ entry }: { entry: LogEntry }) {
       <Text style={[styles.cell, styles.wSat]}>
         {entry.satellitesUsed}/{entry.satellitesInView}
       </Text>
-      <Text style={[styles.cell, styles.wSrc]}>{entry.provider}</Text>
+      <Text style={[styles.cell, styles.wSrc, entry.source === 'net' && styles.net]}>{entry.source}</Text>
       <Text style={[styles.cell, styles.wSeq]}>{entry.sequence ?? ''}</Text>
     </View>
   );
@@ -86,6 +86,7 @@ const styles = StyleSheet.create({
   wNum: { width: 34, textAlign: 'right' },
   wSat: { width: 42, textAlign: 'right' },
   wSrc: { width: 30, textAlign: 'right' },
+  net: { color: colors.danger },
   wSeq: { flex: 1, textAlign: 'right' },
   empty: { color: colors.textMuted, textAlign: 'center', padding: 24 },
 });

@@ -1,7 +1,7 @@
 {
   "name": "tab-gps",
   "version": "0.1.0",
-  "description": "Raw GPS provider access and a location foreground service for TAB",
+  "description": "Fused location, GNSS satellite status and a location foreground service for TAB",
   "main": "index.ts",
   "private": true
 }

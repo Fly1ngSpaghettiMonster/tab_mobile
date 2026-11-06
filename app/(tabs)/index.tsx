@@ -5,7 +5,7 @@ import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'rea
 import { StatTile } from '@/src/components/StatTile';
 import { TripMap } from '@/src/components/TripMap';
 import { formatDuration, km, kmh } from '@/src/geo/stats';
-import { useRecording } from '@/src/recording/RecordingContext';
+import { fixSource, useRecording } from '@/src/recording/RecordingContext';
 import { colors } from '@/src/theme';
 
 export default function MapScreen() {
@@ -46,9 +46,9 @@ export default function MapScreen() {
   const currentSpeed = fix?.speed != null && fix.speed >= 0 ? fix.speed : null;
   const sats = `${rec.satellites.used}/${rec.satellites.inView} satellites`;
   const gpsInfo = !rec.gpsEnabled
-    ? 'GPS is turned off in system settings'
+    ? 'Location is turned off in system settings'
     : fix
-      ? `GPS ±${fix.accuracy?.toFixed(0) ?? '?'} m · ${sats}${rec.isRecording ? ` · ${rec.samples.length} samples` : ''}`
+      ? `${fixSource(fix.satellitesUsed) === 'gnss' ? 'GPS' : 'Wi-Fi/cell'} ±${fix.accuracy?.toFixed(0) ?? '?'} m · ${sats}${rec.isRecording ? ` · ${rec.samples.length} samples` : ''}`
       : `Waiting for GPS fix · ${sats} (go outside if this takes long)`;
 
   return (
