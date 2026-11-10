@@ -143,9 +143,11 @@ function gapStatusText(result: GapResult | null | undefined): string {
   if (result === null) return 'GPS gaps not checked yet (no internet); they will be checked next time.';
   if (result.gaps === 0) return 'No GPS gaps on this trip.';
   const tunnels = result.fills.filter((f) => f.tunnel).length;
-  const filled = `${result.fills.length} of ${result.gaps} GPS gap${result.gaps === 1 ? '' : 's'} followed along roads`;
+  const rail = result.fills.filter((f) => f.mode === 'rail').length;
+  const along = rail === 0 ? 'roads' : rail === result.fills.length ? 'rail lines' : 'roads and rail lines';
+  const filled = `${result.fills.length} of ${result.gaps} GPS gap${result.gaps === 1 ? '' : 's'} followed along ${along}`;
   const tunnelText = tunnels > 0 ? ` (${tunnels} through a tunnel)` : '';
-  return `${filled}${tunnelText} - dashed. Dotted grey: no matching road found.`;
+  return `${filled}${tunnelText} - dashed. Dotted grey: no matching road or rail line found.`;
 }
 
 const styles = StyleSheet.create({

@@ -1,5 +1,6 @@
 import { getGapFills, getJourney, getSamples, saveGapFills } from '../db/database';
-import { fetchOpenFreeMapTile, fillGap, findGaps, type GapFill } from '../geo/gapFill';
+import { fetchOpenFreeMapTile, fillGap, type GapFill } from '../geo/gapFill';
+import { findGaps } from '../geo/gaps';
 import { computeStats, processTrack } from '../geo/stats';
 
 export type GapResult = { gaps: number; fills: GapFill[] };
@@ -8,7 +9,7 @@ export type GapResult = { gaps: number; fills: GapFill[] };
 const running = new Map<number, Promise<GapResult | null>>();
 
 /**
- * Fills a finished journey's GPS gaps along the road network and updates its statistics.
+ * Fills a finished journey's GPS gaps along the road or rail network and updates its statistics.
  * Resolves null when tiles could not be downloaded (e.g. offline); the journey then stays
  * unchecked and is retried the next time the trip is opened.
  */

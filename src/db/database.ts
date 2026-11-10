@@ -10,9 +10,22 @@ export type Journey = JourneyStats & {
   name: string | null;
   /** How the samples were collected, e.g. "gps 1000ms". */
   locationSource: string | null;
-  /** True once GPS gaps have been checked against the road network (see gapFill.ts). */
+  /** True once GPS gaps have been checked against the road and rail network (see gapFill.ts). */
   gapsChecked: boolean;
   sampleCount: number;
+};
+
+/** A live-sharing session on the backend for one journey (see src/share). */
+export type ShareSession = {
+  sessionId: string;
+  journeyId: number;
+  ownerToken: string;
+  viewerUrl: string;
+  /** Highest sample sequence the server has confirmed; -1 before the first upload. */
+  lastAckedSequence: number;
+  /** 'closing' = closed locally, but the server has not confirmed it yet (retried on next start). */
+  status: 'open' | 'closing' | 'closed';
+  createdAtUtc: string;
 };
 
 let dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
@@ -65,7 +78,7 @@ async function open(): Promise<SQLite.SQLiteDatabase> {
   return database;
 }
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 6;
 
 async function migrate(database: SQLite.SQLiteDatabase): Promise<void> {
   const row = await database.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
@@ -99,6 +112,29 @@ async function migrate(database: SQLite.SQLiteDatabase): Promise<void> {
   if (version < 4) {
     // v4: which version of the statistics formulas a trip's stored stats were computed with.
     await database.execAsync('ALTER TABLE journeys ADD COLUMN stats_version INTEGER NOT NULL DEFAULT 0;');
+  }
+  if (version < 5) {
+    // v5: live-sharing sessions on the TAB backend and how far their upload got.
+    await database.execAsync(`
+      CREATE TABLE IF NOT EXISTS share_sessions (
+        session_id TEXT PRIMARY KEY,
+        journey_id INTEGER NOT NULL REFERENCES journeys(id) ON DELETE CASCADE,
+        owner_token TEXT NOT NULL,
+        viewer_url TEXT NOT NULL,
+        last_acked_sequence INTEGER NOT NULL DEFAULT -1,
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at_utc TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS share_sessions_journey ON share_sessions (journey_id);
+    `);
+  }
+  if (version < 6) {
+    // v6: gaps can follow rail lines (metro) and include the start and end of a trip, so every
+    // trip's gaps are checked again the next time it is opened.
+    await database.execAsync(`
+      ALTER TABLE gap_fills ADD COLUMN mode TEXT NOT NULL DEFAULT 'road';
+      UPDATE journeys SET gaps_checked = 0;
+    `);
   }
   await database.execAsync(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
@@ -265,6 +301,7 @@ type GapFillRow = {
   path: string;
   length_m: number;
   tunnel: number;
+  mode: string;
 };
 
 export async function getGapFills(journeyId: number): Promise<GapFill[]> {
@@ -279,6 +316,7 @@ export async function getGapFills(journeyId: number): Promise<GapFill[]> {
     path: JSON.parse(r.path),
     lengthMeters: r.length_m,
     tunnel: r.tunnel === 1,
+    mode: r.mode === 'rail' ? 'rail' : 'road',
   }));
 }
 
@@ -289,13 +327,14 @@ export function saveGapFills(journeyId: number, fills: GapFill[], stats: Journey
       await d.runAsync('DELETE FROM gap_fills WHERE journey_id = ?', journeyId);
       for (const f of fills) {
         await d.runAsync(
-          'INSERT INTO gap_fills (journey_id, from_sequence, to_sequence, path, length_m, tunnel) VALUES (?, ?, ?, ?, ?, ?)',
+          'INSERT INTO gap_fills (journey_id, from_sequence, to_sequence, path, length_m, tunnel, mode) VALUES (?, ?, ?, ?, ?, ?, ?)',
           journeyId,
           f.fromSequence,
           f.toSequence,
           JSON.stringify(f.path),
           f.lengthMeters,
           f.tunnel ? 1 : 0,
+          f.mode,
         );
       }
       await d.runAsync('UPDATE journeys SET gaps_checked = 1 WHERE id = ?', journeyId);
@@ -345,4 +384,62 @@ export async function refreshOutdatedStats(): Promise<void> {
     const stats = computeStats(samples, Date.parse(j.ended_at_utc), fills);
     await enqueueWrite((w) => writeStats(w, j.id, stats));
   }
+}
+
+type ShareSessionRow = {
+  session_id: string;
+  journey_id: number;
+  owner_token: string;
+  viewer_url: string;
+  last_acked_sequence: number;
+  status: ShareSession['status'];
+  created_at_utc: string;
+};
+
+function toShareSession(r: ShareSessionRow): ShareSession {
+  return {
+    sessionId: r.session_id,
+    journeyId: r.journey_id,
+    ownerToken: r.owner_token,
+    viewerUrl: r.viewer_url,
+    lastAckedSequence: r.last_acked_sequence,
+    status: r.status,
+    createdAtUtc: r.created_at_utc,
+  };
+}
+
+export function saveShareSession(s: ShareSession): Promise<void> {
+  return enqueueWrite(async (d) => {
+    await d.runAsync(
+      `INSERT OR REPLACE INTO share_sessions
+        (session_id, journey_id, owner_token, viewer_url, last_acked_sequence, status, created_at_utc)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      s.sessionId,
+      s.journeyId,
+      s.ownerToken,
+      s.viewerUrl,
+      s.lastAckedSequence,
+      s.status,
+      s.createdAtUtc,
+    );
+  });
+}
+
+export function setShareAckedSequence(sessionId: string, sequence: number): Promise<void> {
+  return enqueueWrite(async (d) => {
+    await d.runAsync('UPDATE share_sessions SET last_acked_sequence = ? WHERE session_id = ?', sequence, sessionId);
+  });
+}
+
+export function setShareStatus(sessionId: string, status: ShareSession['status']): Promise<void> {
+  return enqueueWrite(async (d) => {
+    await d.runAsync('UPDATE share_sessions SET status = ? WHERE session_id = ?', status, sessionId);
+  });
+}
+
+/** Sessions not yet confirmed closed by the server. */
+export async function listUnclosedShareSessions(): Promise<ShareSession[]> {
+  const d = await db();
+  const rows = await d.getAllAsync<ShareSessionRow>("SELECT * FROM share_sessions WHERE status != 'closed'");
+  return rows.map(toShareSession);
 }

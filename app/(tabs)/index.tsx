@@ -1,11 +1,12 @@
 import { useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, Pressable, Share, StyleSheet, Text, View } from 'react-native';
 
 import { StatTile } from '@/src/components/StatTile';
 import { TripMap } from '@/src/components/TripMap';
 import { formatDuration, km, kmh } from '@/src/geo/stats';
 import { fixSource, useRecording } from '@/src/recording/RecordingContext';
+import type { ShareState } from '@/src/share/ShareClient';
 import { colors } from '@/src/theme';
 
 export default function MapScreen() {
@@ -55,11 +56,7 @@ export default function MapScreen() {
     <View style={styles.container}>
       <TripMap
         samples={rec.samples}
-        position={
-          fix
-            ? { latitude: fix.latitude, longitude: fix.longitude, accuracyMeters: fix.accuracy, bearing: rec.bearing }
-            : null
-        }
+        position={rec.position ? { ...rec.position, bearing: rec.bearing } : null}
       />
 
       <View style={styles.panel}>
@@ -78,6 +75,74 @@ export default function MapScreen() {
           ) : (
             <Text style={styles.buttonText}>{rec.isRecording ? 'Stop' : 'Record'}</Text>
           )}
+        </Pressable>
+        {rec.isRecording && (
+          <SharePanel share={rec.share} onStart={rec.startSharing} onStop={rec.stopSharing} />
+        )}
+      </View>
+    </View>
+  );
+}
+
+const SHARE_STATUS_TEXT: Record<ShareState['status'], string> = {
+  connecting: 'Connecting…',
+  live: 'Live',
+  reconnecting: 'Offline, reconnecting…',
+  closed: 'Closed',
+};
+
+function SharePanel({
+  share,
+  onStart,
+  onStop,
+}: {
+  share: ShareState | null;
+  onStart: () => Promise<void>;
+  onStop: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  const run = async (action: () => Promise<void>) => {
+    setBusy(true);
+    try {
+      await action();
+    } catch (e) {
+      Alert.alert('Sharing', e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const sendLink = (url: string) =>
+    Share.share({ message: `Follow my trip live: ${url}` }).catch((e) => console.warn('Share sheet failed', e));
+
+  const confirmStop = () =>
+    Alert.alert('Stop sharing?', 'The link stops working for everyone. Recording continues.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Stop sharing', style: 'destructive', onPress: () => run(onStop) },
+    ]);
+
+  if (!share) {
+    return (
+      <Pressable style={[styles.shareButton, styles.shareStart]} onPress={() => run(onStart)} disabled={busy}>
+        {busy ? <ActivityIndicator color={colors.accent} /> : <Text style={styles.shareStartText}>Share live</Text>}
+      </Pressable>
+    );
+  }
+
+  const pending = share.pending > 1 ? ` · ${share.pending} samples waiting` : '';
+  return (
+    <View style={styles.shareBox}>
+      <Text style={styles.gpsInfo}>
+        Sharing: {SHARE_STATUS_TEXT[share.status]}
+        {pending}
+      </Text>
+      <View style={styles.shareRow}>
+        <Pressable style={[styles.shareButton, styles.shareStart, styles.flex]} onPress={() => sendLink(share.viewerUrl)}>
+          <Text style={styles.shareStartText}>Send link</Text>
+        </Pressable>
+        <Pressable style={[styles.shareButton, styles.shareStop, styles.flex]} onPress={confirmStop} disabled={busy}>
+          {busy ? <ActivityIndicator color={colors.danger} /> : <Text style={styles.shareStopText}>Stop sharing</Text>}
         </Pressable>
       </View>
     </View>
@@ -115,4 +180,12 @@ const styles = StyleSheet.create({
   record: { backgroundColor: colors.accent },
   stop: { backgroundColor: colors.danger },
   buttonText: { color: colors.onPrimary, fontSize: 18, fontWeight: '700', letterSpacing: 1 },
+  shareBox: { gap: 6 },
+  shareRow: { flexDirection: 'row', gap: 8 },
+  flex: { flex: 1 },
+  shareButton: { borderRadius: 12, paddingVertical: 10, alignItems: 'center', borderWidth: 2 },
+  shareStart: { borderColor: colors.accent },
+  shareStartText: { color: colors.accent, fontSize: 15, fontWeight: '700' },
+  shareStop: { borderColor: colors.danger },
+  shareStopText: { color: colors.danger, fontSize: 15, fontWeight: '700' },
 });

@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react';
 
 import { recoverUnfinishedJourneys, refreshOutdatedStats } from '@/src/db/database';
 import { RecordingProvider } from '@/src/recording/RecordingContext';
+import { closeLeftoverShareSessions } from '@/src/share/api';
 import { colors } from '@/src/theme';
 
 export { ErrorBoundary } from 'expo-router';
@@ -28,6 +29,8 @@ export default function RootLayout() {
       .finally(() => {
         setReady(true);
         SplashScreen.hideAsync();
+        // Share links of trips that ended without a clean stop; done in the background (needs network).
+        closeLeftoverShareSessions().catch((e) => console.warn('Closing leftover shares failed', e));
       });
   }, []);
 
