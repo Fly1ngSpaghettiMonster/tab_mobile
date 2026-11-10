@@ -1,17 +1,19 @@
 import {
   Camera,
   GeoJSONSource,
+  type CameraRef,
   Layer,
   Map as MapView,
   Marker,
   type LngLatBounds,
   type ViewStateChangeEvent,
 } from '@maplibre/maplibre-react-native';
-import { useMemo, useRef, useState } from 'react';
-import { Pressable, StyleSheet, Text, View, type NativeSyntheticEvent, type StyleProp, type ViewStyle } from 'react-native';
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { Pressable, StyleSheet, Text, View, type GestureResponderEvent, type NativeSyntheticEvent, type StyleProp, type ViewStyle } from 'react-native';
 
 import type { GapFill } from '../geo/gapFill';
 import { approximatePath, findGaps, gapKey, isGap, liveCoarseLines, type Gap } from '../geo/gaps';
+import { BearingSmoother, buildRoute, PlaybackClock, poseAt, routeUpTo, type Pose, type Route } from '../geo/playback';
 import { speedColorExpression, speedScale, type SpeedStop } from '../geo/speedColors';
 import { smoothLine, type SmoothedLine } from '../geo/spline';
 import { processTrack, type GpsSample, type TrackPoint } from '../geo/stats';
@@ -45,11 +47,15 @@ const SPEED_COLOR_STEPS = 40;
 const ROUTE_BASE_COLOR = '#8a96a3';
 const LINE_LAYOUT = { 'line-cap': 'round', 'line-join': 'round' } as const;
 const FIT_PADDING = { top: 48, right: 48, bottom: 48, left: 48 };
-// GPS fixes arrive about once a second; gliding for most of that interval makes the camera move
-// continuously from fix to fix instead of jumping.
+// Without a track to play back (not recording, or only coarse fixes) the camera glides to each
+// new position for most of the ~1 s until the next one.
 const FOLLOW_ANIMATION_MS = 900;
-// A gesture that changed the zoom by more than this counts as zooming, not panning.
-const ZOOM_GESTURE_THRESHOLD = 0.05;
+// A single finger moving further than this on the map is a pan (stops following); anything else
+// (taps, pinches, double-tap zoom) keeps following.
+const PAN_THRESHOLD_PX = 12;
+// The live track is played back while the newest fix is part of it; a newer fix this much later
+// that is not (a coarse Wi-Fi/cell fix in a GPS gap) is shown directly instead.
+const MAX_PLAYBACK_LAG_MS = 3000;
 const INITIAL_LIVE_ZOOM = 16;
 
 type LineFeatures = GeoJSON.FeatureCollection<GeoJSON.LineString>;
@@ -65,8 +71,10 @@ type Stretch = { points: TrackPoint[]; line: SmoothedLine };
 
 export function TripMap({ samples, style, position, colorBySpeed, gapFills, speedStops }: Props) {
   const speedColor = useMemo(() => speedColorExpression(speedStops ?? DEFAULT_SPEED_STOPS), [speedStops]);
-  const points = useMemo(() => processTrack(samples), [samples]);
   const live = position !== undefined;
+  // Live: forward filter only, so points already passed by the played-back arrow never shift when
+  // a new fix arrives. Review: smoothed with the fixes after each point as well.
+  const points = useMemo(() => processTrack(samples, { smooth: !live }), [samples, live]);
 
   // Review mode: all gaps, including stretches without accurate fixes at the start or end.
   const gaps = useMemo<Gap[]>(() => (colorBySpeed ? findGaps(points, samples) : []), [colorBySpeed, points, samples]);
@@ -173,44 +181,66 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
     return w < e || s < n ? [w, s, e, n] : undefined;
   }, [points, gapLines]);
 
-  // Camera props must only change when the position really changes: while the camera moves, the
-  // native map sends JS an event on every frame. Re-sending the stop on every render kept it
-  // animating constantly and flooded the JS thread; one glide per GPS fix is cheap (~14% JS CPU
-  // measured in a dev build, versus ~7% for instant jumps).
+  // Live mode: the track is played back slightly in the past (see playback.ts), so the arrow, the
+  // end of the line and the camera move together and continuously between fixes.
+  const route = useMemo<Route | null>(() => (live ? buildRoute(points) : null), [live, points]);
+  const lastSample = samples[samples.length - 1];
+  const playback =
+    route != null &&
+    route.times.length > 0 &&
+    lastSample != null &&
+    Date.parse(lastSample.timestampUtc) - route.times[route.times.length - 1] <= MAX_PLAYBACK_LAG_MS;
+
   const hasFix = position != null;
   const lat = position?.latitude;
   const lon = position?.longitude;
   const bearing = position?.bearing;
 
   // Follow mode: panning pauses following (the recenter button brings it back), zooming keeps
-  // following and recenters when the pinch ends. No camera updates are sent mid-gesture.
+  // following and recenters when the fingers are lifted. The camera is not moved mid-gesture.
   const [following, setFollowing] = useState(true);
   const [gesturing, setGesturing] = useState(false);
-  // Bumped to re-send the follow stop even if the position has not changed.
+  const cameraRef = useRef<CameraRef>(null);
+  // Read by the playback loop every frame.
+  const followRef = useRef(false);
+  followRef.current = live && following && !gesturing;
+  // Bumped to move the camera back to the position even if it has not changed.
   const [recenterCount, setRecenterCount] = useState(0);
-  const gestureStartZoom = useRef<number | null>(null);
+  const touch = useRef<{ x: number; y: number; multi: boolean; moved: boolean } | null>(null);
   // Current zoom, for sizing the accuracy circle drawn over the map.
   const [zoom, setZoom] = useState(INITIAL_LIVE_ZOOM);
+  // The same, read by the playback loop every frame.
+  const zoomRef = useRef(INITIAL_LIVE_ZOOM);
 
-  const onRegionWillChange = (e: NativeSyntheticEvent<ViewStateChangeEvent>) => {
-    // A finger gesture is reported as a user interaction that is not animated; the native map
-    // also flags the app's own camera moves as user interaction, but those are animated.
-    if (!e.nativeEvent.userInteraction || e.nativeEvent.animated) return;
-    gestureStartZoom.current = e.nativeEvent.zoom;
-    setGesturing(true);
+  // Gestures are read from the touches themselves: the playback moves the camera every frame,
+  // and the map reports those moves much like the user's.
+  const onTouchStart = (e: GestureResponderEvent) => {
+    const t = e.nativeEvent;
+    if (!touch.current) {
+      touch.current = { x: t.pageX, y: t.pageY, multi: false, moved: false };
+      setGesturing(true);
+    }
+    if (t.touches.length > 1) touch.current.multi = true;
+  };
+  const onTouchMove = (e: GestureResponderEvent) => {
+    const g = touch.current;
+    const t = e.nativeEvent;
+    if (!g) return;
+    if (t.touches.length > 1) g.multi = true;
+    else if (Math.hypot(t.pageX - g.x, t.pageY - g.y) > PAN_THRESHOLD_PX) g.moved = true;
+  };
+  const onTouchEnd = (e: GestureResponderEvent) => {
+    const g = touch.current;
+    if (!g || e.nativeEvent.touches.length > 0) return;
+    touch.current = null;
+    setGesturing(false);
+    if (g.moved && !g.multi) setFollowing(false);
+    else setRecenterCount((n) => n + 1);
   };
   const onRegionDidChange = (e: NativeSyntheticEvent<ViewStateChangeEvent>) => {
     const newZoom = e.nativeEvent.zoom;
+    zoomRef.current = newZoom;
     setZoom((z) => (Math.abs(z - newZoom) > 0.01 ? newZoom : z));
-    const startZoom = gestureStartZoom.current;
-    if (startZoom == null) return;
-    gestureStartZoom.current = null;
-    setGesturing(false);
-    if (Math.abs(e.nativeEvent.zoom - startZoom) > ZOOM_GESTURE_THRESHOLD) {
-      setRecenterCount((n) => n + 1);
-    } else {
-      setFollowing(false);
-    }
   };
   const recenter = () => {
     setFollowing(true);
@@ -223,29 +253,29 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [hasFix],
   );
-  const followStop = useMemo(
-    () =>
-      following && !gesturing && lat != null && lon != null
-        ? {
-            center: [lon, lat] as [number, number],
-            bearing,
-            duration: FOLLOW_ANIMATION_MS,
-            easing: 'linear' as const,
-          }
-        : {},
-    // recenterCount forces a new stop object, so the camera jumps back even when standing still.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [lat, lon, bearing, following, gesturing, recenterCount],
-  );
+  // Without playback: glide the camera to each new position.
+  useEffect(() => {
+    if (!live || playback || !following || gesturing || lat == null || lon == null) return;
+    try {
+      cameraRef.current?.easeTo({ center: [lon, lat], bearing, duration: FOLLOW_ANIMATION_MS, easing: 'linear' });
+    } catch {
+      // The native camera is not ready yet (just mounted); the next fix moves it.
+    }
+  }, [live, playback, lat, lon, bearing, following, gesturing, recenterCount]);
 
   const { first, last } = ends;
   const hasLine = routeLines.features.length > 0;
   // While following, the camera centre is the position, so the arrow is drawn at the centre of
-  // the view: the map then glides underneath it instead of the arrow jumping from fix to fix.
+  // the view: the map moves underneath it.
   const puckOverlay = live && position != null && following && !gesturing;
 
   return (
-    <View style={[styles.map, style]}>
+    <View
+      style={[styles.map, style]}
+      onTouchStart={live ? onTouchStart : undefined}
+      onTouchMove={live ? onTouchMove : undefined}
+      onTouchEnd={live ? onTouchEnd : undefined}
+      onTouchCancel={live ? onTouchEnd : undefined}>
       <MapView
         style={styles.map}
         mapStyle={MAP_STYLE_URL}
@@ -254,18 +284,29 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
         touchPitch={false}
         // Heading-up follow mode: the app controls the rotation.
         touchRotate={!live}
-        onRegionWillChange={live ? onRegionWillChange : undefined}
         onRegionDidChange={live ? onRegionDidChange : undefined}>
         {live ? (
           // Remount when the first fix arrives so the initial view zooms in on it.
-          <Camera key={hasFix ? 'fix' : 'nofix'} initialViewState={initialView} {...followStop} />
+          <Camera ref={cameraRef} key={hasFix ? 'fix' : 'nofix'} initialViewState={initialView} />
         ) : bounds ? (
           <Camera bounds={bounds} padding={FIT_PADDING} />
         ) : first ? (
           <Camera center={[first.longitude, first.latitude]} zoom={15} />
         ) : null}
 
-        {hasLine && !colorBySpeed && (
+        {playback && (
+          <LiveRoute
+            route={route}
+            cameraRef={cameraRef}
+            followRef={followRef}
+            zoomRef={zoomRef}
+            recenterCount={recenterCount}
+            accuracyMeters={position?.accuracyMeters ?? null}
+            showMarker={!puckOverlay}
+          />
+        )}
+
+        {hasLine && !colorBySpeed && !playback && (
           <GeoJSONSource id="route" data={routeLines}>
             <Layer
               id="route-line"
@@ -330,7 +371,7 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
           </Marker>
         )}
 
-        {position && !puckOverlay && <PositionMarker position={position} />}
+        {position && !puckOverlay && !playback && <PositionMarker position={position} />}
       </MapView>
       {puckOverlay && <CenteredPuck accuracyMeters={position.accuracyMeters} latitude={position.latitude} zoom={zoom} />}
       {live && hasFix && !following && (
@@ -339,6 +380,94 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
         </Pressable>
       )}
     </View>
+  );
+}
+
+/**
+ * The live route played back slightly in the past: every frame the car's pose is computed from the
+ * playback clock, and the line is drawn exactly up to it while the camera (and so the centred
+ * arrow) moves to it. Lives in its own component so that only it re-renders every frame.
+ */
+function LiveRoute(props: {
+  route: Route;
+  cameraRef: RefObject<CameraRef | null>;
+  followRef: RefObject<boolean>;
+  zoomRef: RefObject<number>;
+  recenterCount: number;
+  accuracyMeters: number | null;
+  showMarker: boolean;
+}) {
+  const { route, cameraRef, followRef, zoomRef, recenterCount, accuracyMeters, showMarker } = props;
+  const [pose, setPose] = useState<(Pose & { bearing: number }) | null>(null);
+  const routeRef = useRef(route);
+  routeRef.current = route;
+  // Set to make the next frame move the camera even if the pose has not changed.
+  const forceCamera = useRef(true);
+  useEffect(() => {
+    forceCamera.current = true;
+  }, [recenterCount]);
+
+  useEffect(() => {
+    const clock = new PlaybackClock();
+    const bearing = new BearingSmoother();
+    let shown: (Pose & { bearing: number }) | null = null;
+    let wasFollowing = false;
+    let lastFrameMs = performance.now();
+    let frame = 0;
+    const loop = () => {
+      frame = requestAnimationFrame(loop);
+      const now = performance.now();
+      const dt = now - lastFrameMs;
+      lastFrameMs = now;
+      const r = routeRef.current;
+      const n = r.times.length;
+      if (n === 0) return;
+      const p = poseAt(r, clock.tick(now, r.times[n - 1]));
+      if (!p) return;
+      const next = { ...p, bearing: bearing.update(p.course, p.gpsBearing, zoomRef.current, dt) };
+      const moved =
+        !shown ||
+        next.index !== shown.index ||
+        next.longitude !== shown.longitude ||
+        next.latitude !== shown.latitude ||
+        next.bearing !== shown.bearing;
+      const following = followRef.current;
+      if (following && (moved || !wasFollowing || forceCamera.current)) {
+        try {
+          cameraRef.current?.jumpTo({ center: [next.longitude, next.latitude], bearing: next.bearing });
+          forceCamera.current = false;
+        } catch {
+          // The native camera is not ready yet; try again next frame.
+        }
+      }
+      wasFollowing = following;
+      if (moved) {
+        shown = next;
+        setPose(next);
+      }
+    };
+    frame = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frame);
+  }, [cameraRef, followRef, zoomRef]);
+
+  // The passed part of the route only changes when the car passes a fix (or new fixes arrive);
+  // only the short head up to the car changes every frame.
+  const index = pose?.index ?? -1;
+  const done = useMemo(() => lineFeatures(routeUpTo(route, Math.min(index, route.points.length - 1))), [route, index]);
+  const head = useMemo(() => lineFeatures(pose && pose.head.length >= 2 ? [pose.head] : []), [pose]);
+
+  return (
+    <>
+      <GeoJSONSource id="route" data={done}>
+        <Layer id="route-line" type="line" layout={LINE_LAYOUT} paint={{ 'line-color': colors.primary, 'line-width': 5 }} />
+      </GeoJSONSource>
+      <GeoJSONSource id="route-head" data={head}>
+        <Layer id="route-head-line" type="line" layout={LINE_LAYOUT} paint={{ 'line-color': colors.primary, 'line-width': 5 }} />
+      </GeoJSONSource>
+      {showMarker && pose && (
+        <PositionMarker position={{ latitude: pose.latitude, longitude: pose.longitude, accuracyMeters, bearing: pose.bearing }} />
+      )}
+    </>
   );
 }
 

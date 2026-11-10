@@ -4,6 +4,8 @@ TAB records GPS data while you drive. It saves every trip on the phone, so you c
 
 Built with React Native, Expo (development build), TypeScript, MapLibre, and expo-sqlite.
 
+How it works inside (GPS collection, storage, track algorithms, gap filling, live sharing, failure handling, code layout): see [TECHNICAL.md](TECHNICAL.md).
+
 ## Location data
 
 Positions come from **Google's fused location provider** at high-accuracy priority, through the local native module in `modules/tab-gps`. It is set to deliver a fix every second, with no batching, and to wait for an accurate first fix.
@@ -22,7 +24,7 @@ Distance, the drawn route and the map arrow come from a filtered track (`src/geo
 - after a trip, a backward pass (Rauch–Tung–Striebel smoother) refines every point using the fixes after it as well.
 
 The route is drawn as a smooth curve through the filtered points (centripetal Catmull-Rom spline, `src/geo/spline.ts`), which does not overshoot between them.
-On the live map the arrow stays at the centre of the view while the map glides underneath, so it moves smoothly from fix to fix.
+While recording, the live map plays the track back about 2 s behind the newest fix (`src/geo/playback.ts`). The next fix is then already known, so the arrow moves continuously and at an even speed along the route instead of stopping at every fix. The map turns smoothly with the road and ignores small wiggles in the direction, more so when zoomed out. The line is drawn exactly up to the arrow and never runs ahead of it. The arrow stays at the centre of the view while the map moves underneath.
 The raw samples stay unchanged in the database.
 
 ### Speed colours
@@ -122,6 +124,7 @@ src/geo/stats.ts          distance and speed statistics
 src/geo/gaps.ts           finding GPS gaps, including at the start and end of a trip
 src/geo/gapFill.ts        filling GPS gaps along roads and rail lines after a trip
 src/geo/spline.ts         drawing the route as a smooth curve
+src/geo/playback.ts       live playback: the moving arrow and route end between fixes
 src/components/           map and UI components
 ```
 
