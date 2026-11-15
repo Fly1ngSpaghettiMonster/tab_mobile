@@ -2,8 +2,10 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { AppState, PermissionsAndroid, Platform } from 'react-native';
 
 import TabGps, { type GpsFix } from '../../modules/tab-gps';
-import { createJourney, deleteJourney, finishJourney, insertSample } from '../db/database';
-import { computeStats, isAccurate, type GpsSample, type JourneyStats } from '../geo/stats';
+import { createJourney, deleteJourney, finishJourney, insertSample, saveShareSession, setShareStatus, type ShareSession } from '../db/database';
+import { computeStats, isAccurate, TrackFilter, type GpsSample, type JourneyStats } from '../geo/stats';
+import { closeAndRecord, createSession, type CloseReason } from '../share/api';
+import { ShareClient, type ShareState } from '../share/ShareClient';
 import { processJourneyGaps } from './gapProcessing';
 
 const MAX_LOG_ENTRIES = 500;
@@ -19,6 +21,8 @@ export function fixSource(satellitesUsed: number | null): 'gnss' | 'net' {
 }
 // Only update the map bearing when moving fast enough for the GPS course to be meaningful.
 const MIN_SPEED_FOR_BEARING_MPS = 1;
+// How long stopping a shared trip waits for the last samples to upload.
+const SHARE_DRAIN_MS = 3_000;
 
 export type LogEntry = {
   key: number;
@@ -38,11 +42,16 @@ export type LogEntry = {
 
 type PermissionState = 'unknown' | 'granted' | 'denied';
 
+/** Where to show the user on the map: filtered, and held still while standing still. */
+export type DisplayPosition = { latitude: number; longitude: number; accuracyMeters: number | null };
+
 type RecordingContextValue = {
   permission: PermissionState;
   requestPermission: () => Promise<void>;
   gpsEnabled: boolean;
   lastFix: GpsFix | null;
+  /** Position for the map arrow and camera (see DisplayPosition). */
+  position: DisplayPosition | null;
   /** Direction of travel in degrees, kept while standing still. */
   bearing: number;
   satellites: { used: number; inView: number };
@@ -56,6 +65,12 @@ type RecordingContextValue = {
   start: () => Promise<void>;
   /** Stops recording; resolves to the saved journey id, or null if nothing was recorded. */
   stop: () => Promise<number | null>;
+  /** Live sharing of the current recording, or null when not shared. */
+  share: ShareState | null;
+  /** Creates a share link for the current recording and starts uploading its samples. */
+  startSharing: () => Promise<void>;
+  /** Stops sharing; the link stops working. Recording continues. */
+  stopSharing: () => Promise<void>;
 };
 
 const RecordingContext = createContext<RecordingContextValue | null>(null);
@@ -64,18 +79,24 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
   const [permission, setPermission] = useState<PermissionState>('unknown');
   const [gpsEnabled, setGpsEnabled] = useState(() => TabGps.isLocationEnabled());
   const [lastFix, setLastFix] = useState<GpsFix | null>(null);
+  const [position, setPosition] = useState<DisplayPosition | null>(null);
   const [bearing, setBearing] = useState(0);
   const [satellites, setSatellites] = useState({ used: 0, inView: 0 });
   const [journeyId, setJourneyId] = useState<number | null>(null);
   const [startedAtMs, setStartedAtMs] = useState<number | null>(null);
   const [samples, setSamples] = useState<GpsSample[]>([]);
   const [log, setLog] = useState<LogEntry[]>([]);
+  const [share, setShare] = useState<ShareState | null>(null);
 
   // Refs so the native event handlers always see the current recording state.
   const journeyIdRef = useRef<number | null>(null);
   const sequenceRef = useRef(0);
   const samplesRef = useRef<GpsSample[]>([]);
   const logKeyRef = useRef(0);
+  const startedAtRef = useRef<string | null>(null);
+  const shareRef = useRef<{ client: ShareClient; session: ShareSession } | null>(null);
+  // Filters every fix (recording or not) for the map arrow, with the same filter as the route.
+  const displayFilterRef = useRef(new TrackFilter());
 
   const requestPermission = useCallback(async () => {
     const res = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
@@ -110,6 +131,20 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       bearingAccuracyDeg: fix.bearingAccuracy,
     };
 
+    // Accurate fixes go through the filter, so the arrow holds still while standing still;
+    // coarse (Wi-Fi/cell) fixes are shown as they are, with their large accuracy circle.
+    const filtered = displayFilterRef.current.push(sample);
+    if (filtered) {
+      // While standing still, keep the same object: no re-render and no camera move at all.
+      setPosition((prev) =>
+        filtered.stationary && prev
+          ? prev
+          : { latitude: filtered.latitude, longitude: filtered.longitude, accuracyMeters: sample.accuracyMeters },
+      );
+    } else {
+      setPosition({ latitude: sample.latitude, longitude: sample.longitude, accuracyMeters: sample.accuracyMeters });
+    }
+
     const entry: LogEntry = {
       key: logKeyRef.current++,
       timestampUtc: sample.timestampUtc,
@@ -131,6 +166,7 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       samplesRef.current = [...samplesRef.current, sample];
       setSamples(samplesRef.current);
       insertSample(sample).catch((e) => console.warn('Failed to save sample', e));
+      shareRef.current?.client.notify();
     }
   }, []);
 
@@ -177,7 +213,9 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
     }
     const now = Date.now();
-    const id = await createJourney(new Date(now).toISOString(), LOCATION_SOURCE);
+    const startedAt = new Date(now).toISOString();
+    const id = await createJourney(startedAt, LOCATION_SOURCE);
+    startedAtRef.current = startedAt;
     sequenceRef.current = 0;
     samplesRef.current = [];
     journeyIdRef.current = id;
@@ -187,9 +225,59 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
     await TabGps.startForegroundService('TAB is recording your trip', 'Tap to open the app.');
   }, []);
 
+  const endShare = useCallback(async (reason: CloseReason) => {
+    const current = shareRef.current;
+    if (!current) return;
+    shareRef.current = null;
+    setShare(null);
+    // When the trip ends, give the last samples a moment to reach the viewers.
+    if (reason === 'ended') await current.client.drain(SHARE_DRAIN_MS);
+    await current.client.stop();
+    // The server request runs in the background, so stopping never waits on the network.
+    closeAndRecord(current.session, reason);
+  }, []);
+
+  const startSharing = useCallback(async () => {
+    const journeyId = journeyIdRef.current;
+    if (journeyId == null || shareRef.current) return;
+    const created = await createSession(journeyId, startedAtRef.current ?? new Date().toISOString(), LOCATION_SOURCE);
+    if (journeyIdRef.current !== journeyId || shareRef.current) {
+      // Recording stopped (or sharing started twice) while the request was in flight.
+      closeAndRecord({ ...created, journeyId, lastAckedSequence: -1, status: 'open', createdAtUtc: new Date().toISOString() }, 'ended');
+      return;
+    }
+    const session: ShareSession = {
+      ...created,
+      journeyId,
+      lastAckedSequence: -1,
+      status: 'open',
+      createdAtUtc: new Date().toISOString(),
+    };
+    await saveShareSession(session);
+    const client = new ShareClient({
+      session,
+      // Everything recorded so far is uploaded too, so viewers see the whole trip.
+      getSamples: () => samplesRef.current,
+      onState: (state) => {
+        if (shareRef.current?.client === client) setShare(state);
+      },
+      onClosedByServer: () => {
+        if (shareRef.current?.client !== client) return;
+        shareRef.current = null;
+        setShare(null);
+        setShareStatus(session.sessionId, 'closed').catch(() => undefined);
+      },
+    });
+    shareRef.current = { client, session };
+    client.start();
+  }, []);
+
+  const stopSharing = useCallback(() => endShare('revoked'), [endShare]);
+
   const stop = useCallback(async () => {
     const id = journeyIdRef.current;
     if (id == null) return null;
+    await endShare('ended');
     journeyIdRef.current = null;
     await TabGps.stopForegroundService();
 
@@ -207,10 +295,11 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
 
     setJourneyId(null);
     setStartedAtMs(null);
+    startedAtRef.current = null;
     samplesRef.current = [];
     setSamples([]);
     return saved;
-  }, []);
+  }, [endShare]);
 
   const liveStats = useMemo(() => computeStats(samples, Date.now()), [samples]);
 
@@ -220,6 +309,7 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       requestPermission,
       gpsEnabled,
       lastFix,
+      position,
       bearing,
       satellites,
       isRecording: journeyId != null,
@@ -231,12 +321,16 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       clearLog: () => setLog([]),
       start,
       stop,
+      share,
+      startSharing,
+      stopSharing,
     }),
     [
       permission,
       requestPermission,
       gpsEnabled,
       lastFix,
+      position,
       bearing,
       satellites,
       journeyId,
@@ -246,6 +340,9 @@ export function RecordingProvider({ children }: { children: ReactNode }) {
       log,
       start,
       stop,
+      share,
+      startSharing,
+      stopSharing,
     ],
   );
 

@@ -1,18 +1,22 @@
 import {
   Camera,
   GeoJSONSource,
+  type CameraRef,
   Layer,
   Map as MapView,
   Marker,
   type LngLatBounds,
   type ViewStateChangeEvent,
 } from '@maplibre/maplibre-react-native';
-import { useMemo, useRef, useState } from 'react';
-import { Pressable, StyleSheet, Text, View, type NativeSyntheticEvent, type StyleProp, type ViewStyle } from 'react-native';
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { Pressable, StyleSheet, Text, View, type GestureResponderEvent, type NativeSyntheticEvent, type StyleProp, type ViewStyle } from 'react-native';
 
-import { findGaps, type GapFill } from '../geo/gapFill';
+import type { GapFill } from '../geo/gapFill';
+import { approximatePath, findGaps, gapKey, isGap, liveCoarseLines, type Gap } from '../geo/gaps';
+import { BearingSmoother, buildRoute, PlaybackClock, poseAt, routeUpTo, type Pose, type Route } from '../geo/playback';
 import { speedColorExpression, speedScale, type SpeedStop } from '../geo/speedColors';
-import { processTrack, type GpsSample } from '../geo/stats';
+import { smoothLine, type SmoothedLine } from '../geo/spline';
+import { processTrack, type GpsSample, type TrackPoint } from '../geo/stats';
 import { colors, MAP_STYLE_URL } from '../theme';
 
 export type MapPosition = {
@@ -43,121 +47,125 @@ const SPEED_COLOR_STEPS = 40;
 const ROUTE_BASE_COLOR = '#8a96a3';
 const LINE_LAYOUT = { 'line-cap': 'round', 'line-join': 'round' } as const;
 const FIT_PADDING = { top: 48, right: 48, bottom: 48, left: 48 };
-// GPS fixes arrive about once a second; gliding for most of that interval makes the camera move
-// continuously from fix to fix instead of jumping.
+// Without a track to play back (not recording, or only coarse fixes) the camera glides to each
+// new position for most of the ~1 s until the next one.
 const FOLLOW_ANIMATION_MS = 900;
-// A gesture that changed the zoom by more than this counts as zooming, not panning.
-const ZOOM_GESTURE_THRESHOLD = 0.05;
+// A single finger moving further than this on the map is a pan (stops following); anything else
+// (taps, pinches, double-tap zoom) keeps following.
+const PAN_THRESHOLD_PX = 12;
+// The live track is played back while the newest fix is part of it; a newer fix this much later
+// that is not (a coarse Wi-Fi/cell fix in a GPS gap) is shown directly instead.
+const MAX_PLAYBACK_LAG_MS = 3000;
+const INITIAL_LIVE_ZOOM = 16;
+
+type LineFeatures = GeoJSON.FeatureCollection<GeoJSON.LineString>;
+const lineFeatures = (lines: [number, number][][]): LineFeatures => ({
+  type: 'FeatureCollection',
+  features: lines
+    .filter((coordinates) => coordinates.length >= 2)
+    .map((coordinates) => ({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates } })),
+});
+
+/** Continuous runs of track points (split at gaps), each with its smoothed line. */
+type Stretch = { points: TrackPoint[]; line: SmoothedLine };
 
 export function TripMap({ samples, style, position, colorBySpeed, gapFills, speedStops }: Props) {
   const speedColor = useMemo(() => speedColorExpression(speedStops ?? DEFAULT_SPEED_STOPS), [speedStops]);
-  const points = useMemo(() => processTrack(samples), [samples]);
   const live = position !== undefined;
+  // Live: forward filter only, so points already passed by the played-back arrow never shift when
+  // a new fix arrives. Review: smoothed with the fixes after each point as well.
+  const points = useMemo(() => processTrack(samples, { smooth: !live }), [samples, live]);
 
-  const routeLine = useMemo<GeoJSON.Feature<GeoJSON.LineString>>(
-    () => ({
-      type: 'Feature',
-      properties: {},
-      geometry: { type: 'LineString', coordinates: points.map((p) => [p.longitude, p.latitude]) },
-    }),
-    [points],
-  );
+  // Review mode: all gaps, including stretches without accurate fixes at the start or end.
+  const gaps = useMemo<Gap[]>(() => (colorBySpeed ? findGaps(points, samples) : []), [colorBySpeed, points, samples]);
 
-  // GPS gaps (review mode only): filled ones are drawn along the road, the rest as a dotted line.
-  const gapLines = useMemo(() => {
-    const filled: GeoJSON.Feature<GeoJSON.LineString>[] = [];
-    const unfilled: GeoJSON.Feature<GeoJSON.LineString>[] = [];
-    const keys = new Set<string>();
-    if (colorBySpeed) {
-      const fillByKey = new Map((gapFills ?? []).map((f) => [`${f.fromSequence}-${f.toSequence}`, f]));
-      for (const gap of findGaps(points, samples)) {
-        const key = `${gap.from.sample.sequence}-${gap.to.sample.sequence}`;
-        keys.add(key);
-        const fill = fillByKey.get(key);
-        const coordinates = fill
-          ? fill.path
-          : [
-              [gap.from.longitude, gap.from.latitude],
-              [gap.to.longitude, gap.to.latitude],
-            ];
-        (fill ? filled : unfilled).push({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates } });
+  // The track split at gaps; each piece is drawn as a smooth curve through its points.
+  const stretches = useMemo<Stretch[]>(() => {
+    const gapKeys = new Set(gaps.filter((g) => !g.edge).map((g) => gapKey(g.from.sample.sequence, g.to.sample.sequence)));
+    const isBreak = (a: TrackPoint, b: TrackPoint) =>
+      colorBySpeed ? gapKeys.has(gapKey(a.sample.sequence, b.sample.sequence)) : isGap(a, b);
+    const parts: TrackPoint[][] = [];
+    let current: TrackPoint[] = [];
+    points.forEach((p, i) => {
+      if (i > 0 && isBreak(points[i - 1], p)) {
+        parts.push(current);
+        current = [];
       }
+      current.push(p);
+    });
+    if (current.length) parts.push(current);
+    return parts.map((pts) => ({ points: pts, line: smoothLine(pts.map((p) => [p.longitude, p.latitude])) }));
+  }, [points, gaps, colorBySpeed]);
+
+  const routeLines = useMemo<LineFeatures>(() => lineFeatures(stretches.map((s) => s.line.coords)), [stretches]);
+
+  // Gaps: review mode draws filled ones along the road or rail line, the rest as a dotted line
+  // through the coarse fixes; live mode draws everything without accurate fixes dotted.
+  const gapLines = useMemo(() => {
+    if (!colorBySpeed) return { filled: lineFeatures([]), unfilled: lineFeatures(liveCoarseLines(points, samples)) };
+    const fillByKey = new Map((gapFills ?? []).map((f) => [gapKey(f.fromSequence, f.toSequence), f]));
+    const filled: [number, number][][] = [];
+    const unfilled: [number, number][][] = [];
+    for (const gap of gaps) {
+      const fill = fillByKey.get(gapKey(gap.from.sample.sequence, gap.to.sample.sequence));
+      if (fill) filled.push(fill.path);
+      else unfilled.push(approximatePath(samples, gap.from, gap.to));
     }
-    return {
-      keys,
-      filled: { type: 'FeatureCollection', features: filled } as GeoJSON.FeatureCollection<GeoJSON.LineString>,
-      unfilled: { type: 'FeatureCollection', features: unfilled } as GeoJSON.FeatureCollection<GeoJSON.LineString>,
-    };
-  }, [colorBySpeed, gapFills, points, samples]);
+    return { filled: lineFeatures(filled), unfilled: lineFeatures(unfilled) };
+  }, [colorBySpeed, gapFills, gaps, points, samples]);
 
   // Speed-coloured route: consecutive segments of similar speed are joined into one line.
   // One feature per GPS sample would be only a few metres long, and MapLibre drops such
   // sub-pixel features when zoomed out, making the whole route disappear.
-  const speedSegments = useMemo<GeoJSON.FeatureCollection<GeoJSON.LineString>>(() => {
+  const speedSegments = useMemo<LineFeatures>(() => {
     const stops = speedStops ?? DEFAULT_SPEED_STOPS;
     const bucketKmh = Math.max(stops[stops.length - 1].kmh / SPEED_COLOR_STEPS, 0.5);
     const features: GeoJSON.Feature<GeoJSON.LineString>[] = [];
-    let run: { bucket: number; coords: [number, number][]; kmhSum: number; count: number } | null = null;
-    const flush = () => {
-      if (run && run.coords.length >= 2) {
-        features.push({
-          type: 'Feature',
-          properties: { kmh: run.kmhSum / run.count },
-          geometry: { type: 'LineString', coordinates: run.coords },
-        });
-      }
-      run = null;
-    };
-    for (let i = 1; i < points.length; i++) {
-      const a = points[i - 1];
-      const b = points[i];
-      // Gaps are drawn separately.
-      if (gapLines.keys.has(`${a.sample.sequence}-${b.sample.sequence}`)) {
-        flush();
-        continue;
-      }
-      const kmh = b.speedMps * 3.6;
-      const bucket = Math.floor(kmh / bucketKmh);
-      if (!run || run.bucket !== bucket) {
-        flush();
-        // Start at the previous point so neighbouring runs touch.
-        run = { bucket, coords: [[a.longitude, a.latitude]], kmhSum: 0, count: 0 };
-      }
-      run.coords.push([b.longitude, b.latitude]);
-      run.kmhSum += kmh;
-      run.count++;
-    }
-    flush();
-    return { type: 'FeatureCollection', features };
-  }, [points, gapLines, speedStops]);
-
-  // Grey line under the whole trip, including gaps filled along roads, so the route is always
-  // visible from start to end whatever the zoom level.
-  const baseLine = useMemo<GeoJSON.Feature<GeoJSON.MultiLineString>>(() => {
-    const fillByKey = new Map((gapFills ?? []).map((f) => [`${f.fromSequence}-${f.toSequence}`, f]));
-    const lines: [number, number][][] = [];
-    let current: [number, number][] = [];
-    points.forEach((p, i) => {
-      if (i > 0) {
-        const key = `${points[i - 1].sample.sequence}-${p.sample.sequence}`;
-        if (gapLines.keys.has(key)) {
-          const fill = fillByKey.get(key);
-          if (fill) current.push(...fill.path.slice(1, -1));
-          else {
-            // Unfilled gaps get their own dotted line; break the base line there.
-            if (current.length >= 2) lines.push(current);
-            current = [];
+    for (const { points: pts, line } of stretches) {
+      // A run covers the curve between two of its points; neighbouring runs share their end point.
+      let run: { bucket: number; from: number; to: number; kmhSum: number; count: number } | null = null;
+      const flush = () => {
+        if (run) {
+          const coordinates = line.coords.slice(line.index[run.from], line.index[run.to] + 1);
+          if (coordinates.length >= 2) {
+            features.push({ type: 'Feature', properties: { kmh: run.kmhSum / run.count }, geometry: { type: 'LineString', coordinates } });
           }
         }
+        run = null;
+      };
+      for (let i = 1; i < pts.length; i++) {
+        const kmh = pts[i].speedMps * 3.6;
+        const bucket = Math.floor(kmh / bucketKmh);
+        if (!run || run.bucket !== bucket) {
+          flush();
+          run = { bucket, from: i - 1, to: i, kmhSum: 0, count: 0 };
+        }
+        run.to = i;
+        run.kmhSum += kmh;
+        run.count++;
       }
-      current.push([p.longitude, p.latitude]);
-    });
-    if (current.length >= 2) lines.push(current);
-    return { type: 'Feature', properties: {}, geometry: { type: 'MultiLineString', coordinates: lines } };
-  }, [points, gapLines, gapFills]);
+      flush();
+    }
+    return { type: 'FeatureCollection', features };
+  }, [stretches, speedStops]);
+
+  // Grey line under the whole trip, including filled gaps, so the route is always visible from
+  // start to end whatever the zoom level.
+  const baseLine = useMemo<LineFeatures>(
+    () => lineFeatures([...stretches.map((s) => s.line.coords), ...gapLines.filled.features.map((f) => f.geometry.coordinates as [number, number][])]),
+    [stretches, gapLines],
+  );
+
+  // Start and end of the trip: at a coarse position if recording started or ended without GPS.
+  const ends = useMemo(() => {
+    const leading = gaps.find((g) => g.edge === 'start' || g.edge === 'both');
+    const trailing = [...gaps].reverse().find((g) => g.edge === 'end' || g.edge === 'both');
+    const first = leading?.from ?? points[0];
+    const last = trailing?.to ?? points[points.length - 1];
+    return { first, last };
+  }, [gaps, points]);
 
   const bounds = useMemo<LngLatBounds | undefined>(() => {
-    if (points.length < 2) return undefined;
     let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
     const extend = (lon: number, lat: number) => {
       w = Math.min(w, lon);
@@ -166,45 +174,73 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
       n = Math.max(n, lat);
     };
     for (const p of points) extend(p.longitude, p.latitude);
-    // Road paths through gaps can bend away from the GPS points (e.g. a curved tunnel).
-    for (const f of gapLines.filled.features) for (const [lon, lat] of f.geometry.coordinates) extend(lon, lat);
-    return [w, s, e, n];
+    // Paths through gaps can bend away from the GPS points (e.g. a curved tunnel).
+    for (const f of [...gapLines.filled.features, ...gapLines.unfilled.features]) {
+      for (const [lon, lat] of f.geometry.coordinates) extend(lon, lat);
+    }
+    return w < e || s < n ? [w, s, e, n] : undefined;
   }, [points, gapLines]);
 
-  // Camera props must only change when the position really changes: while the camera moves, the
-  // native map sends JS an event on every frame. Re-sending the stop on every render kept it
-  // animating constantly and flooded the JS thread; one glide per GPS fix is cheap (~14% JS CPU
-  // measured in a dev build, versus ~7% for instant jumps).
+  // Live mode: the track is played back slightly in the past (see playback.ts), so the arrow, the
+  // end of the line and the camera move together and continuously between fixes.
+  const route = useMemo<Route | null>(() => (live ? buildRoute(points) : null), [live, points]);
+  const lastSample = samples[samples.length - 1];
+  const playback =
+    route != null &&
+    route.times.length > 0 &&
+    lastSample != null &&
+    Date.parse(lastSample.timestampUtc) - route.times[route.times.length - 1] <= MAX_PLAYBACK_LAG_MS;
+
   const hasFix = position != null;
   const lat = position?.latitude;
   const lon = position?.longitude;
   const bearing = position?.bearing;
 
   // Follow mode: panning pauses following (the recenter button brings it back), zooming keeps
-  // following and recenters when the pinch ends. No camera updates are sent mid-gesture.
+  // following and recenters when the fingers are lifted. The camera is not moved mid-gesture.
   const [following, setFollowing] = useState(true);
   const [gesturing, setGesturing] = useState(false);
-  // Bumped to re-send the follow stop even if the position has not changed.
+  const cameraRef = useRef<CameraRef>(null);
+  // Read by the playback loop every frame.
+  const followRef = useRef(false);
+  followRef.current = live && following && !gesturing;
+  // Bumped to move the camera back to the position even if it has not changed.
   const [recenterCount, setRecenterCount] = useState(0);
-  const gestureStartZoom = useRef<number | null>(null);
+  const touch = useRef<{ x: number; y: number; multi: boolean; moved: boolean } | null>(null);
+  // Current zoom, for sizing the accuracy circle drawn over the map.
+  const [zoom, setZoom] = useState(INITIAL_LIVE_ZOOM);
+  // The same, read by the playback loop every frame.
+  const zoomRef = useRef(INITIAL_LIVE_ZOOM);
 
-  const onRegionWillChange = (e: NativeSyntheticEvent<ViewStateChangeEvent>) => {
-    // A finger gesture is reported as a user interaction that is not animated; the native map
-    // also flags the app's own camera moves as user interaction, but those are animated.
-    if (!e.nativeEvent.userInteraction || e.nativeEvent.animated) return;
-    gestureStartZoom.current = e.nativeEvent.zoom;
-    setGesturing(true);
+  // Gestures are read from the touches themselves: the playback moves the camera every frame,
+  // and the map reports those moves much like the user's.
+  const onTouchStart = (e: GestureResponderEvent) => {
+    const t = e.nativeEvent;
+    if (!touch.current) {
+      touch.current = { x: t.pageX, y: t.pageY, multi: false, moved: false };
+      setGesturing(true);
+    }
+    if (t.touches.length > 1) touch.current.multi = true;
+  };
+  const onTouchMove = (e: GestureResponderEvent) => {
+    const g = touch.current;
+    const t = e.nativeEvent;
+    if (!g) return;
+    if (t.touches.length > 1) g.multi = true;
+    else if (Math.hypot(t.pageX - g.x, t.pageY - g.y) > PAN_THRESHOLD_PX) g.moved = true;
+  };
+  const onTouchEnd = (e: GestureResponderEvent) => {
+    const g = touch.current;
+    if (!g || e.nativeEvent.touches.length > 0) return;
+    touch.current = null;
+    setGesturing(false);
+    if (g.moved && !g.multi) setFollowing(false);
+    else setRecenterCount((n) => n + 1);
   };
   const onRegionDidChange = (e: NativeSyntheticEvent<ViewStateChangeEvent>) => {
-    const startZoom = gestureStartZoom.current;
-    if (startZoom == null) return;
-    gestureStartZoom.current = null;
-    setGesturing(false);
-    if (Math.abs(e.nativeEvent.zoom - startZoom) > ZOOM_GESTURE_THRESHOLD) {
-      setRecenterCount((n) => n + 1);
-    } else {
-      setFollowing(false);
-    }
+    const newZoom = e.nativeEvent.zoom;
+    zoomRef.current = newZoom;
+    setZoom((z) => (Math.abs(z - newZoom) > 0.01 ? newZoom : z));
   };
   const recenter = () => {
     setFollowing(true);
@@ -212,32 +248,34 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
   };
 
   const initialView = useMemo(
-    () => (hasFix ? { center: [lon!, lat!] as [number, number], zoom: 16 } : { zoom: 3 }),
+    () => (hasFix ? { center: [lon!, lat!] as [number, number], zoom: INITIAL_LIVE_ZOOM } : { zoom: 3 }),
     // Only read once, when the camera mounts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [hasFix],
   );
-  const followStop = useMemo(
-    () =>
-      following && !gesturing && lat != null && lon != null
-        ? {
-            center: [lon, lat] as [number, number],
-            bearing,
-            duration: FOLLOW_ANIMATION_MS,
-            easing: 'linear' as const,
-          }
-        : {},
-    // recenterCount forces a new stop object, so the camera jumps back even when standing still.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [lat, lon, bearing, following, gesturing, recenterCount],
-  );
+  // Without playback: glide the camera to each new position.
+  useEffect(() => {
+    if (!live || playback || !following || gesturing || lat == null || lon == null) return;
+    try {
+      cameraRef.current?.easeTo({ center: [lon, lat], bearing, duration: FOLLOW_ANIMATION_MS, easing: 'linear' });
+    } catch {
+      // The native camera is not ready yet (just mounted); the next fix moves it.
+    }
+  }, [live, playback, lat, lon, bearing, following, gesturing, recenterCount]);
 
-  const first = points[0];
-  const last = points[points.length - 1];
-  const hasLine = points.length >= 2;
+  const { first, last } = ends;
+  const hasLine = routeLines.features.length > 0;
+  // While following, the camera centre is the position, so the arrow is drawn at the centre of
+  // the view: the map moves underneath it.
+  const puckOverlay = live && position != null && following && !gesturing;
 
   return (
-    <View style={[styles.map, style]}>
+    <View
+      style={[styles.map, style]}
+      onTouchStart={live ? onTouchStart : undefined}
+      onTouchMove={live ? onTouchMove : undefined}
+      onTouchEnd={live ? onTouchEnd : undefined}
+      onTouchCancel={live ? onTouchEnd : undefined}>
       <MapView
         style={styles.map}
         mapStyle={MAP_STYLE_URL}
@@ -246,19 +284,30 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
         touchPitch={false}
         // Heading-up follow mode: the app controls the rotation.
         touchRotate={!live}
-        onRegionWillChange={live ? onRegionWillChange : undefined}
         onRegionDidChange={live ? onRegionDidChange : undefined}>
         {live ? (
           // Remount when the first fix arrives so the initial view zooms in on it.
-          <Camera key={hasFix ? 'fix' : 'nofix'} initialViewState={initialView} {...followStop} />
+          <Camera ref={cameraRef} key={hasFix ? 'fix' : 'nofix'} initialViewState={initialView} />
         ) : bounds ? (
           <Camera bounds={bounds} padding={FIT_PADDING} />
         ) : first ? (
           <Camera center={[first.longitude, first.latitude]} zoom={15} />
         ) : null}
 
-        {hasLine && !colorBySpeed && (
-          <GeoJSONSource id="route" data={routeLine}>
+        {playback && (
+          <LiveRoute
+            route={route}
+            cameraRef={cameraRef}
+            followRef={followRef}
+            zoomRef={zoomRef}
+            recenterCount={recenterCount}
+            accuracyMeters={position?.accuracyMeters ?? null}
+            showMarker={!puckOverlay}
+          />
+        )}
+
+        {hasLine && !colorBySpeed && !playback && (
+          <GeoJSONSource id="route" data={routeLines}>
             <Layer
               id="route-line"
               type="line"
@@ -268,7 +317,7 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
           </GeoJSONSource>
         )}
 
-        {hasLine && colorBySpeed && (
+        {colorBySpeed && baseLine.features.length > 0 && (
           <GeoJSONSource id="route-base" data={baseLine} tolerance={0}>
             <Layer
               id="route-base-line"
@@ -290,7 +339,7 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
           </GeoJSONSource>
         )}
 
-        {colorBySpeed && gapLines.unfilled.features.length > 0 && (
+        {gapLines.unfilled.features.length > 0 && (
           <GeoJSONSource id="gaps-unfilled" data={gapLines.unfilled} tolerance={0}>
             <Layer
               id="gaps-unfilled-line"
@@ -322,13 +371,124 @@ export function TripMap({ samples, style, position, colorBySpeed, gapFills, spee
           </Marker>
         )}
 
-        {position && <PositionMarker position={position} />}
+        {position && !puckOverlay && !playback && <PositionMarker position={position} />}
       </MapView>
+      {puckOverlay && <CenteredPuck accuracyMeters={position.accuracyMeters} latitude={position.latitude} zoom={zoom} />}
       {live && hasFix && !following && (
         <Pressable style={styles.recenter} onPress={recenter} accessibilityLabel="Recenter on my position">
           <Text style={styles.recenterText}>◎</Text>
         </Pressable>
       )}
+    </View>
+  );
+}
+
+/**
+ * The live route played back slightly in the past: every frame the car's pose is computed from the
+ * playback clock, and the line is drawn exactly up to it while the camera (and so the centred
+ * arrow) moves to it. Lives in its own component so that only it re-renders every frame.
+ */
+function LiveRoute(props: {
+  route: Route;
+  cameraRef: RefObject<CameraRef | null>;
+  followRef: RefObject<boolean>;
+  zoomRef: RefObject<number>;
+  recenterCount: number;
+  accuracyMeters: number | null;
+  showMarker: boolean;
+}) {
+  const { route, cameraRef, followRef, zoomRef, recenterCount, accuracyMeters, showMarker } = props;
+  const [pose, setPose] = useState<(Pose & { bearing: number }) | null>(null);
+  const routeRef = useRef(route);
+  routeRef.current = route;
+  // Set to make the next frame move the camera even if the pose has not changed.
+  const forceCamera = useRef(true);
+  useEffect(() => {
+    forceCamera.current = true;
+  }, [recenterCount]);
+
+  useEffect(() => {
+    const clock = new PlaybackClock();
+    const bearing = new BearingSmoother();
+    let shown: (Pose & { bearing: number }) | null = null;
+    let wasFollowing = false;
+    let lastFrameMs = performance.now();
+    let frame = 0;
+    const loop = () => {
+      frame = requestAnimationFrame(loop);
+      const now = performance.now();
+      const dt = now - lastFrameMs;
+      lastFrameMs = now;
+      const r = routeRef.current;
+      const n = r.times.length;
+      if (n === 0) return;
+      const p = poseAt(r, clock.tick(now, r.times[n - 1]));
+      if (!p) return;
+      const next = { ...p, bearing: bearing.update(p.course, p.gpsBearing, zoomRef.current, dt) };
+      const moved =
+        !shown ||
+        next.index !== shown.index ||
+        next.longitude !== shown.longitude ||
+        next.latitude !== shown.latitude ||
+        next.bearing !== shown.bearing;
+      const following = followRef.current;
+      if (following && (moved || !wasFollowing || forceCamera.current)) {
+        try {
+          cameraRef.current?.jumpTo({ center: [next.longitude, next.latitude], bearing: next.bearing });
+          forceCamera.current = false;
+        } catch {
+          // The native camera is not ready yet; try again next frame.
+        }
+      }
+      wasFollowing = following;
+      if (moved) {
+        shown = next;
+        setPose(next);
+      }
+    };
+    frame = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frame);
+  }, [cameraRef, followRef, zoomRef]);
+
+  // The passed part of the route only changes when the car passes a fix (or new fixes arrive);
+  // only the short head up to the car changes every frame.
+  const index = pose?.index ?? -1;
+  const done = useMemo(() => lineFeatures(routeUpTo(route, Math.min(index, route.points.length - 1))), [route, index]);
+  const head = useMemo(() => lineFeatures(pose && pose.head.length >= 2 ? [pose.head] : []), [pose]);
+
+  return (
+    <>
+      <GeoJSONSource id="route" data={done}>
+        <Layer id="route-line" type="line" layout={LINE_LAYOUT} paint={{ 'line-color': colors.primary, 'line-width': 5 }} />
+      </GeoJSONSource>
+      <GeoJSONSource id="route-head" data={head}>
+        <Layer id="route-head-line" type="line" layout={LINE_LAYOUT} paint={{ 'line-color': colors.primary, 'line-width': 5 }} />
+      </GeoJSONSource>
+      {showMarker && pose && (
+        <PositionMarker position={{ latitude: pose.latitude, longitude: pose.longitude, accuracyMeters, bearing: pose.bearing }} />
+      )}
+    </>
+  );
+}
+
+// MapLibre draws the world 512 px wide at zoom 0.
+const EARTH_CIRCUMFERENCE_M = 40_075_016.686;
+const metersPerPixel = (latitude: number, zoom: number) =>
+  (EARTH_CIRCUMFERENCE_M * Math.cos((latitude * Math.PI) / 180)) / (512 * 2 ** zoom);
+
+/** Position arrow and accuracy circle fixed at the centre of the map view (follow mode). */
+function CenteredPuck({ accuracyMeters, latitude, zoom }: { accuracyMeters: number | null; latitude: number; zoom: number }) {
+  const radius = (accuracyMeters ?? 0) / metersPerPixel(latitude, zoom);
+  return (
+    <View style={styles.overlay} pointerEvents="none">
+      {radius > 17 && (
+        <View
+          style={[styles.accuracy, { width: 2 * radius, height: 2 * radius, borderRadius: radius, marginLeft: -radius, marginTop: -radius }]}
+        />
+      )}
+      <View style={[styles.puck, styles.centered]}>
+        <View style={styles.arrow} />
+      </View>
     </View>
   );
 }
@@ -344,8 +504,7 @@ function PositionMarker({ position }: { position: MapPosition }) {
     [position.longitude, position.latitude],
   );
   // Circle radius is in pixels; convert metres to pixels at zoom 22 and let it scale with zoom.
-  const metersPerPixelAtZoom22 = 0.0373 * Math.cos((position.latitude * Math.PI) / 180);
-  const radiusAtZoom22 = (position.accuracyMeters ?? 0) / metersPerPixelAtZoom22;
+  const radiusAtZoom22 = (position.accuracyMeters ?? 0) / metersPerPixel(position.latitude, 22);
 
   return (
     <>
@@ -389,6 +548,16 @@ const styles = StyleSheet.create({
   },
   recenterText: { fontSize: 26, color: colors.primary },
   dot: { width: 18, height: 18, borderRadius: 9, borderWidth: 3, borderColor: '#fff' },
+  overlay: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, alignItems: 'center', justifyContent: 'center' },
+  accuracy: {
+    position: 'absolute',
+    left: '50%',
+    top: '50%',
+    backgroundColor: 'rgba(2, 158, 225, 0.15)',
+    borderWidth: 1,
+    borderColor: 'rgba(2, 158, 225, 0.4)',
+  },
+  centered: { position: 'absolute' },
   puck: {
     width: 34,
     height: 34,

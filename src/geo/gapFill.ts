@@ -1,49 +1,47 @@
 import { VectorTile } from '@mapbox/vector-tile';
 import { PbfReader } from 'pbf';
 
-import { haversineMeters, isAccurate, MAX_PLAUSIBLE_SPEED_MPS, type GpsSample, type TrackPoint } from './stats';
+import type { Gap } from './gaps';
+import { MAX_PLAUSIBLE_SPEED_MPS } from './track';
 
 /**
- * Fills GPS gaps (tunnels, underground stretches) after a trip by following the road network.
+ * Fills GPS gaps (tunnels, underground stretches) after a trip by following the road network,
+ * or the rail network for metro rides.
  *
- * Road geometry comes from the same OpenMapTiles vector tiles the map shows: for each gap we
- * download the few zoom-14 tiles around it, build a small road graph and take the shortest
- * drivable path between the last good fix before the gap and the first good fix after it.
- * The path is only used if it is plausible (not much longer than the straight line, drivable
+ * Geometry comes from the same OpenMapTiles vector tiles the map shows: for each gap we
+ * download the few zoom-14 tiles around it, build a small graph of roads (and one of rail lines)
+ * and take the shortest path between the positions on either side of the gap.
+ * A path is only used if it is plausible (not much longer than the straight line, possible
  * in the time the gap lasted, and consistent with any coarse Wi-Fi/cell fixes from the gap).
  */
 
-/** A stretch without accurate fixes, between two accepted track points. */
-export type Gap = {
-  from: TrackPoint;
-  to: TrackPoint;
-  /** Raw samples inside the gap (typically coarse Wi-Fi/cell fixes). */
-  inner: GpsSample[];
-};
+export type NetworkMode = 'road' | 'rail';
 
 export type GapFill = {
   fromSequence: number;
   toSequence: number;
-  /** [longitude, latitude] pairs from the gap start to its end, along the roads. */
+  /** [longitude, latitude] pairs from the gap start to its end, along the roads or rails. */
   path: [number, number][];
   lengthMeters: number;
-  /** True when the path goes through a road marked as a tunnel. */
+  /** True when the path goes through a road or rail line marked as a tunnel. */
   tunnel: boolean;
+  /** Which network the path follows. */
+  mode: NetworkMode;
 };
 
 export type TileFetcher = (z: number, x: number, y: number) => Promise<ArrayBuffer | null>;
 
-// A gap must last this long and span this distance before we try to fill it.
-const MIN_GAP_SECONDS = 8;
-const MIN_GAP_METERS = 120;
 const TILE_ZOOM = 14;
 const MAX_TILES_PER_GAP = 60;
 // Width of the strip around the gap's straight line that is searched for roads: first narrow,
 // then (if that finds no connection) a fraction of the gap length.
 const NARROW_MARGIN_METERS = 400;
 const WIDE_MARGIN_FACTOR = 0.15;
-// Gap endpoints must lie this close to a road to be snapped onto it.
-const MAX_SNAP_METERS = 40;
+// Metro stations and their exits can lie this far from the track, so a gap end at an accurate
+// (street-level) fix may be snapped onto a rail line from further away than onto a road.
+const MIN_RAIL_SNAP_METERS = 150;
+// If at least this share of the fixes inside a gap saw no satellites, the gap was underground.
+const UNDERGROUND_SHARE = 0.5;
 // Line ends this close to another road are joined to it (roads split across tiles).
 const JOIN_METERS = 8;
 const GRID_CELL_METERS = 50;
@@ -57,22 +55,8 @@ const COARSE_FIX_MIN_TOLERANCE_METERS = 150;
 const COARSE_FIX_AGREEMENT = 0.7;
 
 const DRIVABLE_CLASSES = new Set(['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'minor', 'service']);
-
-export function findGaps(points: TrackPoint[], samples: GpsSample[]): Gap[] {
-  const gaps: Gap[] = [];
-  for (let i = 1; i < points.length; i++) {
-    const from = points[i - 1];
-    const to = points[i];
-    const seconds = (Date.parse(to.sample.timestampUtc) - Date.parse(from.sample.timestampUtc)) / 1000;
-    const meters = haversineMeters(from.latitude, from.longitude, to.latitude, to.longitude);
-    if (seconds < MIN_GAP_SECONDS || meters < MIN_GAP_METERS) continue;
-    const inner = samples.filter(
-      (s) => s.sequence > from.sample.sequence && s.sequence < to.sample.sequence && !isAccurate(s),
-    );
-    gaps.push({ from, to, inner });
-  }
-  return gaps;
-}
+// Railways, and metro / light rail / tram lines (class "transit" in OpenMapTiles).
+const RAIL_CLASSES = new Set(['rail', 'transit']);
 
 // --- Geometry helpers: a local metric projection around the gap -------------------------
 
@@ -117,23 +101,27 @@ function tilePointToLonLat(z: number, tx: number, ty: number, px: number, py: nu
   return [lon, lat] as [number, number];
 }
 
-type RoadLine = { coords: [number, number][]; oneway: number; tunnel: boolean };
+type RoadLine = { coords: [number, number][]; oneway: number; tunnel: boolean; mode: NetworkMode };
 
-function decodeRoads(buffer: ArrayBuffer, z: number, x: number, y: number): RoadLine[] {
+function decodeLines(buffer: ArrayBuffer, z: number, x: number, y: number): RoadLine[] {
   const layer = new VectorTile(new PbfReader(buffer)).layers.transportation;
   if (!layer) return [];
-  const roads: RoadLine[] = [];
+  const lines: RoadLine[] = [];
   for (let i = 0; i < layer.length; i++) {
     const f = layer.feature(i);
-    if (f.type !== 2 || !DRIVABLE_CLASSES.has(String(f.properties.class))) continue;
-    const oneway = Number(f.properties.oneway ?? 0);
+    if (f.type !== 2) continue;
+    const cls = String(f.properties.class);
+    const mode: NetworkMode | null = DRIVABLE_CLASSES.has(cls) ? 'road' : RAIL_CLASSES.has(cls) ? 'rail' : null;
+    if (!mode) continue;
+    // One-way only matters on roads.
+    const oneway = mode === 'road' ? Number(f.properties.oneway ?? 0) : 0;
     const tunnel = f.properties.brunnel === 'tunnel';
     for (const line of f.loadGeometry()) {
       if (line.length < 2) continue;
-      roads.push({ coords: line.map((p) => tilePointToLonLat(z, x, y, p.x, p.y, layer.extent)), oneway, tunnel });
+      lines.push({ coords: line.map((p) => tilePointToLonLat(z, x, y, p.x, p.y, layer.extent)), oneway, tunnel, mode });
     }
   }
-  return roads;
+  return lines;
 }
 
 // --- Road graph -----------------------------------------------------------------------------
@@ -222,7 +210,7 @@ class RoadGraph {
     return n;
   }
 
-  shortestPath(start: number, goal: number): { nodes: number[]; length: number; tunnel: boolean } | null {
+  shortestPath(start: number, goal: number): { nodes: number[]; length: number; tunnelMeters: number } | null {
     const distTo = new Float64Array(this.nodes.length).fill(Infinity);
     const prev = new Int32Array(this.nodes.length).fill(-1);
     const viaTunnel = new Uint8Array(this.nodes.length);
@@ -245,12 +233,12 @@ class RoadGraph {
     }
     if (!Number.isFinite(distTo[goal])) return null;
     const nodes: number[] = [];
-    let tunnel = false;
+    let tunnelMeters = 0;
     for (let n = goal; n !== -1; n = prev[n]) {
       nodes.push(n);
-      if (viaTunnel[n]) tunnel = true;
+      if (viaTunnel[n] && prev[n] !== -1) tunnelMeters += distTo[n] - distTo[prev[n]];
     }
-    return { nodes: nodes.reverse(), length: distTo[goal], tunnel };
+    return { nodes: nodes.reverse(), length: distTo[goal], tunnelMeters };
   }
 }
 
@@ -306,14 +294,50 @@ class MinHeap {
 // --- Filling a gap --------------------------------------------------------------------------
 
 /**
- * Tries to replace one gap with a road path. Returns null when no plausible path is found;
- * throws when tiles cannot be downloaded (so the caller can retry later).
+ * Tries to replace one gap with a road path, or a rail path (metro). Returns null when no
+ * plausible path is found; throws when tiles cannot be downloaded (so the caller can retry later).
  */
 export async function fillGap(
   gap: Gap,
   fetchTile: TileFetcher,
   log: (message: string) => void = () => {},
 ): Promise<GapFill | null> {
+  // Roads and rail lines come from the same tiles; each tile is downloaded once.
+  const tileCache = new Map<string, RoadLine[]>();
+  const getLines = async (x: number, y: number) => {
+    const key = `${x}/${y}`;
+    let lines = tileCache.get(key);
+    if (!lines) {
+      const buffer = await fetchTile(TILE_ZOOM, x, y);
+      lines = buffer ? decodeLines(buffer, TILE_ZOOM, x, y) : [];
+      tileCache.set(key, lines);
+    }
+    return lines;
+  };
+
+  const road = await findPath(gap, 'road', getLines, (m) => log(`road: ${m}`));
+  const rail = await findPath(gap, 'rail', getLines, (m) => log(`rail: ${m}`));
+  if (road && rail) {
+    // Both fit. Underground (no satellites seen) favours the path that runs in a tunnel, so a
+    // metro ride follows the metro line rather than the street above it.
+    const blind = gap.inner.filter((s) => (s.satellitesInView ?? 0) === 0).length;
+    const underground = gap.inner.length > 0 && blind / gap.inner.length >= UNDERGROUND_SHARE;
+    const pick = underground && rail.tunnelShare > road.tunnelShare ? rail : road;
+    log(`both fit (underground: ${underground}); using ${pick.fill.mode}`);
+    return pick.fill;
+  }
+  return (road ?? rail)?.fill ?? null;
+}
+
+type Candidate = { fill: GapFill; tunnelShare: number };
+
+/** Shortest plausible path for a gap on one network (roads or rail lines). */
+async function findPath(
+  gap: Gap,
+  mode: NetworkMode,
+  getLines: (x: number, y: number) => Promise<RoadLine[]>,
+  log: (message: string) => void,
+): Promise<Candidate | null> {
   const a = gap.from;
   const b = gap.to;
   const proj = makeProjection((a.latitude + b.latitude) / 2, (a.longitude + b.longitude) / 2);
@@ -321,11 +345,11 @@ export async function fillGap(
   const pb = proj.toXY(b.longitude, b.latitude);
   const straight = dist(pa, pb);
   const seconds = (Date.parse(b.sample.timestampUtc) - Date.parse(a.sample.timestampUtc)) / 1000;
+  const snap = gap.snapMeters.map((m) => (mode === 'rail' ? Math.max(m, MIN_RAIL_SNAP_METERS) : m));
 
-  // Search a narrow strip along the gap first; roads such as long tunnels can curve far from
+  // Search a narrow strip along the gap first; lines such as long tunnels can curve far from
   // the straight line, so widen the strip if the narrow one does not connect the two ends.
   const margins = [NARROW_MARGIN_METERS, Math.max(NARROW_MARGIN_METERS, straight * WIDE_MARGIN_FACTOR)];
-  const tileCache = new Map<string, RoadLine[]>();
   for (const margin of new Set(margins)) {
     const tiles = corridorTiles(pa, pb, margin, proj);
     if (tiles.length > MAX_TILES_PER_GAP) {
@@ -336,51 +360,46 @@ export async function fillGap(
     const graph = new RoadGraph();
     const lineEnds: number[] = [];
     for (const { x, y } of tiles) {
-      const key = `${x}/${y}`;
-      let roads = tileCache.get(key);
-      if (!roads) {
-        const buffer = await fetchTile(TILE_ZOOM, x, y);
-        roads = buffer ? decodeRoads(buffer, TILE_ZOOM, x, y) : [];
-        tileCache.set(key, roads);
-      }
-      for (const road of roads) {
+      for (const line of await getLines(x, y)) {
+        if (line.mode !== mode) continue;
         let prevNode = -1;
-        road.coords.forEach(([lon, lat], i) => {
+        line.coords.forEach(([lon, lat], i) => {
           const n = graph.node(proj.toXY(lon, lat));
-          if (i > 0) graph.addSegment(prevNode, n, road.oneway, road.tunnel);
-          if (i === 0 || i === road.coords.length - 1) lineEnds.push(n);
+          if (i > 0) graph.addSegment(prevNode, n, line.oneway, line.tunnel);
+          if (i === 0 || i === line.coords.length - 1) lineEnds.push(n);
           prevNode = n;
         });
       }
     }
-    log(`${margin.toFixed(0)} m strip: ${tiles.length} tiles, ${graph.segments.length} road segments`);
+    log(`${margin.toFixed(0)} m strip: ${tiles.length} tiles, ${graph.segments.length} segments`);
     if (graph.segments.length === 0) continue;
 
-    // Join loose line ends to nearby roads (tile clipping and simplification leave small breaks).
+    // Join loose line ends to nearby lines (tile clipping and simplification leave small breaks).
     for (const end of lineEnds) {
       const joined = graph.snap(graph.nodes[end], JOIN_METERS, new Set([end]));
       if (joined !== null) graph.link(end, joined, 0, false);
     }
 
-    const start = graph.snap(pa, MAX_SNAP_METERS);
-    const goal = graph.snap(pb, MAX_SNAP_METERS);
+    const start = graph.snap(pa, snap[0]);
+    const goal = graph.snap(pb, snap[1]);
     if (start === null || goal === null) {
-      log(`no road within ${MAX_SNAP_METERS} m of the gap ${start === null ? 'start' : 'end'}`);
-      return null;
+      log(`nothing within ${(start === null ? snap[0] : snap[1]).toFixed(0)} m of the gap ${start === null ? 'start' : 'end'}`);
+      continue;
     }
 
     const route = graph.shortestPath(start, goal);
     if (!route) {
-      log('no road connection between gap start and end');
+      log('no connection between gap start and end');
       continue;
     }
     const pathXY = [pa, ...route.nodes.map((n) => graph.nodes[n]), pb];
-    return checkRoute(gap, pathXY, route.tunnel, straight, seconds, proj, log);
+    const fill = checkRoute(gap, pathXY, route.tunnelMeters > 0, straight, seconds, proj, mode, log);
+    return fill ? { fill, tunnelShare: route.length > 0 ? route.tunnelMeters / route.length : 0 } : null;
   }
   return null;
 }
 
-/** Plausibility checks for a road path found for a gap; returns the fill or null. */
+/** Plausibility checks for a path found for a gap; returns the fill or null. */
 function checkRoute(
   gap: Gap,
   pathXY: XY[],
@@ -388,17 +407,18 @@ function checkRoute(
   straight: number,
   seconds: number,
   proj: ReturnType<typeof makeProjection>,
+  mode: NetworkMode,
   log: (message: string) => void,
 ): GapFill | null {
   let lengthMeters = 0;
   for (let i = 1; i < pathXY.length; i++) lengthMeters += dist(pathXY[i - 1], pathXY[i]);
 
   if (lengthMeters > Math.max(straight * MAX_DETOUR_FACTOR, straight + MAX_DETOUR_EXTRA_METERS)) {
-    log(`road path too long: ${lengthMeters.toFixed(0)} m vs ${straight.toFixed(0)} m straight`);
+    log(`path too long: ${lengthMeters.toFixed(0)} m vs ${straight.toFixed(0)} m straight`);
     return null;
   }
   if (lengthMeters / seconds > MAX_PLAUSIBLE_SPEED_MPS) {
-    log(`road path not drivable in ${seconds} s`);
+    log(`path not possible in ${seconds} s`);
     return null;
   }
 
@@ -412,7 +432,7 @@ function checkRoute(
       if (nearest <= Math.max(1.5 * s.accuracyMeters!, COARSE_FIX_MIN_TOLERANCE_METERS)) agreeing++;
     }
     if (agreeing / coarse.length < COARSE_FIX_AGREEMENT) {
-      log(`only ${agreeing}/${coarse.length} coarse fixes agree with the road path`);
+      log(`only ${agreeing}/${coarse.length} coarse fixes agree with the path`);
       return null;
     }
   }
@@ -423,6 +443,7 @@ function checkRoute(
     path: pathXY.map((p) => proj.toLonLat(p)),
     lengthMeters,
     tunnel,
+    mode,
   };
 }
 
